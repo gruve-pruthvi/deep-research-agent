@@ -1,0 +1,22 @@
+# OS files
+.DS_Store
+
+# Common local artifacts
+*.log
+
+# Python
+**/.venv/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+
+# Node
+**/node_modules/
+**/dist/
+**/.vite/
+
+# Local data
+**/postgres_data/
+**/qdrant_storage/
+**/research_runs.db
