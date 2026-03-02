@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import AnyMessage, AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
@@ -98,6 +98,42 @@ def build_graph() -> Any:
     graph.add_edge("assistant", END)
     return graph.compile()
 
+
+def build_research_graph() -> Any:
+    """Build a LangGraph StateGraph mirroring the research pipeline topology for visualization."""
+    rg: StateGraph = StateGraph(ResearchState)
+
+    async def _noop(state: ResearchState) -> Dict[str, Any]:  # noqa: ARG001
+        return {}
+
+    for node_name in [
+        "plan", "search", "score_sources", "extract",
+        "chunk_docs", "retrieval", "gaps",
+        "researchers", "analyst", "critic",
+        "verify", "writer", "save",
+    ]:
+        rg.add_node(node_name, _noop)
+
+    rg.add_edge(START, "plan")
+    rg.add_edge("plan", "search")
+    rg.add_edge("search", "score_sources")
+    rg.add_edge("score_sources", "extract")
+    rg.add_edge("extract", "chunk_docs")
+    rg.add_edge("chunk_docs", "retrieval")
+    rg.add_edge("retrieval", "gaps")
+    rg.add_conditional_edges(
+        "gaps",
+        lambda s: "plan" if s.get("gaps") else "researchers",
+        {"plan": "plan", "researchers": "researchers"},
+    )
+    rg.add_edge("researchers", "analyst")
+    rg.add_edge("analyst", "critic")
+    rg.add_edge("critic", "verify")
+    rg.add_edge("verify", "writer")
+    rg.add_edge("writer", "save")
+    rg.add_edge("save", END)
+
+    return rg.compile()
 
 
 memory_store: Dict[str, List[AnyMessage]] = {}
@@ -256,6 +292,7 @@ tools = [get_current_utc_time, run_python]
 llm_with_tools = llm.bind_tools(tools)
 
 compiled_graph = build_graph()
+compiled_research_graph = build_research_graph()
 
 
 def init_db() -> None:
@@ -339,6 +376,11 @@ def save_run(
         conn.commit()
     finally:
         conn.close()
+    # Attempt to init persistent memory collection (non-fatal)
+    try:
+        ensure_memory_collection()
+    except Exception:
+        pass
 
 
 async def search_web(query: str, max_results: int = 5) -> List[SearchResult]:
@@ -578,7 +620,28 @@ async def extract_document(result: SearchResult) -> Document:
             logger.warning("Image parsing failed url=%s error=%s", result.url, str(exc))
     decoded = raw.decode("utf-8", "ignore")
     content = strip_html(decoded)
+    # Fallback to Playwright for JS-heavy pages that returned near-empty HTML
+    if len(content) < 200 and os.getenv("ENABLE_PLAYWRIGHT", "").lower() == "true":
+        playwright_content = await extract_document_playwright(result.url)
+        if playwright_content:
+            content = playwright_content
     return Document(title=result.title, url=result.url, content=normalize_text(content))
+
+
+async def extract_document_playwright(url: str) -> str:
+    """Fetch JS-rendered content via Playwright headless browser."""
+    try:
+        from playwright.async_api import async_playwright  # type: ignore
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.goto(url, wait_until="networkidle", timeout=15000)
+            content = await page.content()
+            await browser.close()
+            return strip_html(content)
+    except Exception as exc:
+        logger.warning("Playwright extraction failed url=%s error=%s", url, str(exc))
+        return ""
 
 
 def build_embeddings() -> OpenAIEmbeddings:
@@ -666,12 +729,23 @@ async def index_and_retrieve(
 
 
 research_llm = ChatOpenAI(
-    model="gpt-4o-mini",
+    model=os.getenv("WORKER_MODEL", "gpt-4o-mini"),
     temperature=0.2,
 )
 
 research_llm_stream = ChatOpenAI(
-    model="gpt-4o-mini",
+    model=os.getenv("WORKER_MODEL", "gpt-4o-mini"),
+    temperature=0.2,
+    streaming=True,
+)
+
+orchestrator_llm = ChatOpenAI(
+    model=os.getenv("ORCHESTRATOR_MODEL", "gpt-4o"),
+    temperature=0.2,
+)
+
+orchestrator_llm_stream = ChatOpenAI(
+    model=os.getenv("ORCHESTRATOR_MODEL", "gpt-4o"),
     temperature=0.2,
     streaming=True,
 )
@@ -709,13 +783,13 @@ async def plan_queries(state: ResearchState) -> Dict[str, Any]:
     gap_context = ""
     if state.get("gaps"):
         gap_context = f"Known gaps: {', '.join(state['gaps'])}"
-    memory_items = load_memory(state["query"])
+    memory_items = await load_memory(state["query"])
     memory_context = ""
     if memory_items:
         memory_context = "\n".join([f"- {item['summary']}" for item in memory_items])
         memory_context = f"Related memory:\n{memory_context}"
     prompt = f"Research question: {state['query']}\n{gap_context}\n{memory_context}"
-    response = await research_llm.ainvoke(
+    response = await orchestrator_llm.ainvoke(
         [SystemMessage(content=system), HumanMessage(content=prompt)]
     )
     queries = parse_search_queries(response.content)
@@ -809,7 +883,26 @@ def build_source_list(sources: List[SearchResult]) -> str:
     )
 
 
-def save_memory(query: str, summary: str) -> None:
+MEMORY_COLLECTION = "research_memory_embeddings"
+
+
+def ensure_memory_collection() -> None:
+    """Create persistent Qdrant collection for semantic memory if it doesn't exist."""
+    try:
+        client = get_qdrant_client()
+        if not client.collection_exists(collection_name=MEMORY_COLLECTION):
+            client.create_collection(
+                collection_name=MEMORY_COLLECTION,
+                vectors_config=qdrant_models.VectorParams(
+                    size=1536, distance=qdrant_models.Distance.COSINE
+                ),
+            )
+    except Exception as exc:
+        logger.warning("Memory collection init failed: %s", str(exc))
+
+
+async def save_memory(query: str, summary: str) -> None:
+    mem_id = uuid.uuid4().hex
     conn = psycopg.connect(
         dbname=os.getenv("POSTGRES_DB", "postgres"),
         user=os.getenv("POSTGRES_USER", "postgres"),
@@ -824,14 +917,33 @@ def save_memory(query: str, summary: str) -> None:
                 INSERT INTO research_memory (id, query, summary, created_at)
                 VALUES (%s, %s, %s, %s)
                 """,
-                (uuid.uuid4().hex, query, summary, datetime.now(timezone.utc)),
+                (mem_id, query, summary, datetime.now(timezone.utc)),
             )
         conn.commit()
     finally:
         conn.close()
+    # Also embed and upsert to Qdrant for semantic search
+    try:
+        ensure_memory_collection()
+        embeddings = build_embeddings()
+        vector = await embeddings.aembed_query(query)
+        client = get_qdrant_client()
+        client.upsert(
+            collection_name=MEMORY_COLLECTION,
+            points=[
+                qdrant_models.PointStruct(
+                    id=mem_id,
+                    vector=vector,
+                    payload={"query": query, "summary": summary},
+                )
+            ],
+        )
+    except Exception as exc:
+        logger.warning("Memory semantic indexing failed: %s", str(exc))
 
 
-def load_memory(query: str, limit: int = 3) -> List[Dict[str, str]]:
+def load_memory_sync(query: str, limit: int = 3) -> List[Dict[str, str]]:
+    """Fallback: substring search via Postgres ILIKE."""
     conn = psycopg.connect(
         dbname=os.getenv("POSTGRES_DB", "postgres"),
         user=os.getenv("POSTGRES_USER", "postgres"),
@@ -855,6 +967,30 @@ def load_memory(query: str, limit: int = 3) -> List[Dict[str, str]]:
         return [{"query": row[0], "summary": row[1]} for row in rows]
     finally:
         conn.close()
+
+
+async def load_memory(query: str, limit: int = 3) -> List[Dict[str, str]]:
+    """Semantic memory search via Qdrant embeddings with SQL fallback."""
+    try:
+        ensure_memory_collection()
+        embeddings = build_embeddings()
+        vector = await embeddings.aembed_query(query)
+        client = get_qdrant_client()
+        response = client.query_points(
+            collection_name=MEMORY_COLLECTION,
+            query=vector,
+            limit=limit,
+        )
+        results = []
+        for hit in response.points:
+            payload = hit.payload or {}
+            if payload.get("query") and payload.get("summary"):
+                results.append({"query": payload["query"], "summary": payload["summary"]})
+        if results:
+            return results
+    except Exception as exc:
+        logger.warning("Semantic memory search failed, falling back to SQL: %s", str(exc))
+    return load_memory_sync(query, limit)
 
 
 def build_doc_snippets(documents: List[Document], max_chars: int = 1200) -> List[str]:
@@ -901,7 +1037,7 @@ async def run_analyst(state: ResearchState) -> str:
     )
     notes = "\n\n".join(state["researcher_notes"])
     user = f"Research question: {state['query']}\n\nResearcher notes:\n{notes}"
-    analyst_llm = research_llm.bind_tools([run_python])
+    analyst_llm = orchestrator_llm.bind_tools([run_python])
     response = await analyst_llm.ainvoke(
         [SystemMessage(content=system), HumanMessage(content=user)]
     )
@@ -926,7 +1062,7 @@ async def run_critic(state: ResearchState) -> str:
         f"Analyst summary:\n{state['analyst_summary']}\n\n"
         f"Sources:\n{build_source_list(state['sources'])}"
     )
-    response = await research_llm.ainvoke(
+    response = await orchestrator_llm.ainvoke(
         [SystemMessage(content=system), HumanMessage(content=user)]
     )
     return response.content
@@ -944,7 +1080,7 @@ async def run_verifier(state: ResearchState) -> tuple[str, float]:
         f"Critic notes:\n{state['critic_notes']}\n\n"
         f"Sources:\n{build_source_list(state['sources'])}"
     )
-    response = await research_llm.ainvoke(
+    response = await orchestrator_llm.ainvoke(
         [SystemMessage(content=system), HumanMessage(content=user)]
     )
     try:
@@ -995,11 +1131,58 @@ def build_synthesis_prompt(state: ResearchState) -> List[AnyMessage]:
 
 
 async def synthesize(state: ResearchState) -> Dict[str, Any]:
-    response = await research_llm.ainvoke(build_synthesis_prompt(state))
+    response = await orchestrator_llm.ainvoke(build_synthesis_prompt(state))
     return {"report": response.content}
 
 
+async def clarify_query(query: str) -> List[str]:
+    """Return 1–2 clarifying questions if the query is ambiguous, else empty list."""
+    system = (
+        "You are a research assistant. If the query is ambiguous and would meaningfully benefit "
+        "from 1-2 targeted clarifying questions, return them as a JSON array of strings. "
+        "If the query is clear and self-contained, return an empty JSON array []. "
+        "Do not include code fences. Return ONLY a JSON array."
+    )
+    response = await orchestrator_llm.ainvoke(
+        [SystemMessage(content=system), HumanMessage(content=f"Query: {query}")]
+    )
+    try:
+        data = json.loads(response.content.strip())
+        if isinstance(data, list):
+            return [str(q).strip() for q in data if str(q).strip()]
+    except Exception:
+        logger.warning("clarify_query parsing failed content=%s", response.content[:200])
+    return []
+
+
+async def verify_citations(report: str, sources: List[SearchResult]) -> str:
+    """Post-process report to fix mismatched [N] citation numbers."""
+    if not report or not sources:
+        return report
+    system = (
+        "You are a citation verifier. Given a research report with inline [N] citations and a "
+        "numbered source list, verify that each [N] reference matches the correct source. "
+        "Correct any wrong citation numbers. Return the corrected report only, without explanation."
+    )
+    source_list = build_source_list(sources)
+    user = f"Report:\n{report}\n\nSources:\n{source_list}"
+    try:
+        response = await orchestrator_llm.ainvoke(
+            [SystemMessage(content=system), HumanMessage(content=user)]
+        )
+        return response.content or report
+    except Exception as exc:
+        logger.warning("Citation verification failed: %s", str(exc))
+        return report
+
+
 init_db()
+
+
+@app.on_event("startup")
+async def log_graph_diagrams() -> None:
+    logger.info("=== Chat graph (Mermaid) ===\n%s", compiled_graph.get_graph().draw_mermaid())
+    logger.info("=== Research pipeline graph (Mermaid) ===\n%s", compiled_research_graph.get_graph().draw_mermaid())
 
 
 def depth_config(depth: str) -> Dict[str, int]:
@@ -1014,27 +1197,58 @@ def depth_config(depth: str) -> Dict[str, int]:
 async def run_research_loop(
     state: ResearchState,
     emit_status: Callable[[str, str, Dict[str, Any] | None], Awaitable[None]] | None = None,
+    max_iters: int = 3,
+    approved_queries: List[str] | None = None,
 ) -> ResearchState:
-    max_iters = 3
     for iteration in range(1, max_iters + 1):
         state["iteration"] = iteration
         if emit_status:
             await emit_status("plan", f"Planning iteration {iteration}", None)
-        plan_result = await plan_queries(state)
-        state.update(plan_result)
+
+        # Use pre-approved queries on first iteration if provided
+        if iteration == 1 and approved_queries:
+            state["search_queries"] = approved_queries
+        else:
+            try:
+                plan_result = await plan_queries(state)
+                state.update(plan_result)
+            except Exception as exc:
+                logger.error("plan_queries failed iteration=%d error=%s", iteration, str(exc))
+                if emit_status:
+                    await emit_status("warning", f"Planning failed: {exc}", {"stage": "plan"})
+                break
+
         if emit_status:
             await emit_status(
                 "queries", "Generated search queries", {"queries": state["search_queries"]}
             )
+        # Emit plan preview so frontend can display the planned queries
+        if emit_status:
+            await emit_status(
+                "plan_preview",
+                "Research plan ready",
+                {"queries": state["search_queries"], "iteration": iteration},
+            )
 
         if emit_status:
             await emit_status("search", f"Searching (iteration {iteration})", None)
-        search_result = await run_search(state)
-        state.update(search_result)
+        try:
+            search_result = await run_search(state)
+            state.update(search_result)
+        except Exception as exc:
+            logger.error("run_search failed iteration=%d error=%s", iteration, str(exc))
+            if emit_status:
+                await emit_status("warning", f"Search failed: {exc}", {"stage": "search"})
+            # Continue with empty sources rather than aborting
+            state["sources"] = state.get("sources", [])
 
         heuristic_ranked = apply_credibility_scores(state["sources"], {})
         llm_targets = heuristic_ranked[: min(8, len(heuristic_ranked))]
-        llm_scores = await score_sources_llm(llm_targets)
+        try:
+            llm_scores = await score_sources_llm(llm_targets)
+        except Exception as exc:
+            logger.warning("score_sources_llm failed: %s", str(exc))
+            llm_scores = {}
         scored_sources = apply_credibility_scores(state["sources"], llm_scores)
         state["sources"] = scored_sources
 
@@ -1051,16 +1265,20 @@ async def run_research_loop(
                             "credibility": src.credibility,
                         }
                         for src in state["sources"][:5]
-                    ]
-                    ,
+                    ],
                     "providers": provider_breakdown(state["sources"]),
                 },
             )
 
         if emit_status:
             await emit_status("extract", "Extracting and indexing sources", None)
-        fetch_result = await fetch_sources(state)
-        state.update(fetch_result)
+        try:
+            fetch_result = await fetch_sources(state)
+            state.update(fetch_result)
+        except Exception as exc:
+            logger.error("fetch_sources failed: %s", str(exc))
+            if emit_status:
+                await emit_status("warning", f"Document extraction failed: {exc}", {"stage": "extract"})
         if emit_status:
             await emit_status(
                 "documents",
@@ -1068,8 +1286,13 @@ async def run_research_loop(
                 {"documents": len(state["documents"])},
             )
 
-        index_result = await index_sources(state)
-        state.update(index_result)
+        try:
+            index_result = await index_sources(state)
+            state.update(index_result)
+        except Exception as exc:
+            logger.error("index_sources failed: %s", str(exc))
+            if emit_status:
+                await emit_status("warning", f"Indexing failed, using raw chunks: {exc}", {"stage": "retrieval"})
         if emit_status:
             await emit_status(
                 "retrieval",
@@ -1077,8 +1300,15 @@ async def run_research_loop(
                 {"chunks": len(state["retrieved"])},
             )
 
-        gap_result = await assess_gaps(state)
-        state["gaps"] = gap_result.get("gaps", [])
+        try:
+            gap_result = await assess_gaps(state)
+            state["gaps"] = gap_result.get("gaps", [])
+        except Exception as exc:
+            logger.warning("assess_gaps failed: %s", str(exc))
+            if emit_status:
+                await emit_status("warning", f"Gap assessment failed: {exc}", {"stage": "gaps"})
+            gap_result = {"continue": False, "gaps": []}
+            state["gaps"] = []
         if emit_status:
             await emit_status(
                 "gaps",
@@ -1095,6 +1325,60 @@ async def run_research_loop(
 @app.get("/")
 async def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/graph")
+async def get_graph_diagrams() -> Dict[str, str]:
+    """Return Mermaid diagrams for the chat and research pipeline graphs."""
+    return {
+        "chat_graph": compiled_graph.get_graph().draw_mermaid(),
+        "research_graph": compiled_research_graph.get_graph().draw_mermaid(),
+    }
+
+
+@app.get("/graph/view", response_class=HTMLResponse)
+async def view_graph_diagrams() -> HTMLResponse:
+    """Render both graphs in the browser using Mermaid.js."""
+    chat_mermaid = compiled_graph.get_graph().draw_mermaid()
+    research_mermaid = compiled_research_graph.get_graph().draw_mermaid()
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Deep Research Agent — Graph View</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <style>
+    body {{ font-family: system-ui, sans-serif; background: #f9f9fb; margin: 0; padding: 2rem; }}
+    h1 {{ font-size: 1.4rem; margin-bottom: 2rem; color: #333; }}
+    h2 {{ font-size: 1rem; font-weight: 600; color: #555; margin: 2rem 0 0.75rem; }}
+    .graph-card {{
+      background: #fff; border: 1px solid #e2e2e8; border-radius: 10px;
+      padding: 1.5rem; margin-bottom: 2rem;
+      box-shadow: 0 1px 4px rgba(0,0,0,.06);
+    }}
+    .mermaid svg {{ max-width: 100%; height: auto; }}
+  </style>
+</head>
+<body>
+  <h1>Deep Research Agent — Graph View</h1>
+
+  <h2>Chat Graph</h2>
+  <div class="graph-card">
+    <div class="mermaid">{chat_mermaid}</div>
+  </div>
+
+  <h2>Research Pipeline Graph</h2>
+  <div class="graph-card">
+    <div class="mermaid">{research_mermaid}</div>
+  </div>
+
+  <script>
+    mermaid.initialize({{ startOnLoad: true, theme: 'default' }});
+  </script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
 
 
 @app.post("/chat/stream")
@@ -1223,7 +1507,7 @@ async def run_research(body: Dict[str, Any]) -> Dict[str, Any]:
             for src in result["sources"][:10]
         ],
     }
-    save_memory(query, result.get("report", "")[:2000])
+    await save_memory(query, result.get("report", "")[:2000])
     save_run(run_id, session_id, query, depth, "completed", {"state": result})
     return {
         "query": query,
@@ -1237,26 +1521,43 @@ async def run_research(body: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+@app.post("/research/clarify")
+async def research_clarify(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Return clarifying questions for ambiguous queries, or proceed immediately."""
+    query = body.get("query", "").strip()
+    if not query:
+        return {"questions": [], "proceed": True}
+    questions = await clarify_query(query)
+    if questions:
+        return {"questions": questions, "proceed": False}
+    return {"questions": [], "proceed": True}
+
+
 @app.post("/research/stream")
 async def run_research_stream(body: Dict[str, Any], request: Request) -> StreamingResponse:
     query = body.get("query")
     session_id = body.get("session_id") or uuid.uuid4().hex
     depth = body.get("depth") or "standard"
+    raw_iters = body.get("max_iterations", 3)
+    max_iterations = max(1, min(5, int(raw_iters)))
+    approved_queries: List[str] | None = body.get("approved_queries") or None
     if not query:
         logger.warning("run_research_stream missing query")
         return StreamingResponse(
             iter([f"data: {json.dumps({'error': 'Missing query'})}\n\n"]),
             media_type="text/event-stream",
         )
-    logger.info("run_research_stream session_id=%s", session_id)
+    logger.info("run_research_stream session_id=%s max_iterations=%d", session_id, max_iterations)
 
     async def event_stream() -> AsyncGenerator[str, None]:
         run_id = uuid.uuid4().hex
         config = depth_config(depth)
         queue: asyncio.Queue[str] = asyncio.Queue()
+
         async def emit_status(stage: str, message: str, data: Dict[str, Any] | None = None) -> None:
             payload = {"type": "status", "stage": stage, "message": message, "data": data}
             await queue.put(f"data: {json.dumps(payload)}\n\n")
+
         try:
             state: ResearchState = {
                 "session_id": session_id,
@@ -1285,7 +1586,14 @@ async def run_research_stream(body: Dict[str, Any], request: Request) -> Streami
 
             save_run(run_id, session_id, query, depth, "running", {"state": state})
 
-            loop_task = asyncio.create_task(run_research_loop(state, emit_status=emit_status))
+            loop_task = asyncio.create_task(
+                run_research_loop(
+                    state,
+                    emit_status=emit_status,
+                    max_iters=max_iterations,
+                    approved_queries=approved_queries,
+                )
+            )
 
             while True:
                 if loop_task.done() and queue.empty():
@@ -1298,6 +1606,10 @@ async def run_research_stream(body: Dict[str, Any], request: Request) -> Streami
                         break
                     continue
 
+            # Drain any remaining queued events
+            while not queue.empty():
+                yield queue.get_nowait()
+
             state = await loop_task
             await emit_status("researchers", "Summarizing sources", None)
             state["researcher_notes"] = await run_researchers(state)
@@ -1309,12 +1621,21 @@ async def run_research_stream(body: Dict[str, Any], request: Request) -> Streami
             verifier_notes, uncertainty = await run_verifier(state)
             state["verifier_notes"] = verifier_notes
             state["uncertainty_score"] = uncertainty
+            # Emit verify result so frontend can display uncertainty + notes
+            await emit_status(
+                "verify",
+                "Evidence verified",
+                {
+                    "uncertainty": state["uncertainty_score"],
+                    "verifier_notes": state["verifier_notes"],
+                },
+            )
             save_run(run_id, session_id, query, depth, "synthesizing", {"state": state})
             prompt = build_writer_prompt(state)
             await emit_status("writer", "Writing report", None)
             report_parts: List[str] = []
 
-            async for chunk in research_llm_stream.astream(prompt):
+            async for chunk in orchestrator_llm_stream.astream(prompt):
                 if await request.is_disconnected():
                     break
                 delta = getattr(chunk, "content", None)
@@ -1325,7 +1646,10 @@ async def run_research_stream(body: Dict[str, Any], request: Request) -> Streami
                 yield f"data: {payload}\n\n"
 
             if not await request.is_disconnected():
-                state["report"] = "".join(report_parts)
+                raw_report = "".join(report_parts)
+                # Citation verification pass
+                await emit_status("writer", "Verifying citations", None)
+                state["report"] = await verify_citations(raw_report, state["sources"])
                 state["confidence_score"] = compute_confidence(
                     state["sources"], state["uncertainty_score"]
                 )
@@ -1346,12 +1670,14 @@ async def run_research_stream(body: Dict[str, Any], request: Request) -> Streami
                     "Transparency report ready",
                     {
                         "confidence": state["confidence_score"],
+                        "uncertainty": state["uncertainty_score"],
+                        "verifier_notes": state["verifier_notes"],
                         "evaluation": state["evaluation"],
                         "transparency": state["transparency"],
                     },
                 )
                 save_run(run_id, session_id, query, depth, "completed", {"state": state})
-                save_memory(query, state.get("report", "")[:2000])
+                await save_memory(query, state.get("report", "")[:2000])
                 await emit_status("done", "Report complete", None)
                 yield "data: [DONE]\n\n"
         except Exception as exc:
@@ -1360,3 +1686,96 @@ async def run_research_stream(body: Dict[str, Any], request: Request) -> Streami
             yield f"data: {payload}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.get("/research/history")
+async def get_research_history(session_id: str | None = None) -> Dict[str, Any]:
+    """List past research runs, optionally filtered by session_id."""
+    conn = psycopg.connect(
+        dbname=os.getenv("POSTGRES_DB", "postgres"),
+        user=os.getenv("POSTGRES_USER", "postgres"),
+        password=os.getenv("POSTGRES_PASSWORD", "postgres"),
+        host=os.getenv("POSTGRES_HOST", "localhost"),
+        port=os.getenv("POSTGRES_PORT", "5432"),
+    )
+    try:
+        with conn.cursor() as cur:
+            if session_id:
+                cur.execute(
+                    """
+                    SELECT id, session_id, query, depth, status, updated_at
+                    FROM research_runs
+                    WHERE session_id = %s
+                    ORDER BY updated_at DESC
+                    LIMIT 50
+                    """,
+                    (session_id,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, session_id, query, depth, status, updated_at
+                    FROM research_runs
+                    ORDER BY updated_at DESC
+                    LIMIT 50
+                    """
+                )
+            rows = cur.fetchall()
+        runs = [
+            {
+                "id": row[0],
+                "session_id": row[1],
+                "query": row[2],
+                "depth": row[3],
+                "status": row[4],
+                "updated_at": row[5].isoformat() if row[5] else None,
+            }
+            for row in rows
+        ]
+        return {"runs": runs}
+    finally:
+        conn.close()
+
+
+@app.get("/research/{run_id}")
+async def get_research_run(run_id: str) -> Dict[str, Any]:
+    """Retrieve a specific research run by ID including the report."""
+    conn = psycopg.connect(
+        dbname=os.getenv("POSTGRES_DB", "postgres"),
+        user=os.getenv("POSTGRES_USER", "postgres"),
+        password=os.getenv("POSTGRES_PASSWORD", "postgres"),
+        host=os.getenv("POSTGRES_HOST", "localhost"),
+        port=os.getenv("POSTGRES_PORT", "5432"),
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, session_id, query, depth, status, updated_at, data_json
+                FROM research_runs
+                WHERE id = %s
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return {"error": "Run not found"}
+        state = row[6] if row[6] else {}
+        if isinstance(state, dict) and "state" in state:
+            state = state["state"]
+        return {
+            "id": row[0],
+            "session_id": row[1],
+            "query": row[2],
+            "depth": row[3],
+            "status": row[4],
+            "updated_at": row[5].isoformat() if row[5] else None,
+            "report": state.get("report", ""),
+            "sources": state.get("sources", []),
+            "evaluation": state.get("evaluation", {}),
+            "uncertainty_score": state.get("uncertainty_score"),
+            "confidence_score": state.get("confidence_score"),
+        }
+    finally:
+        conn.close()
+
