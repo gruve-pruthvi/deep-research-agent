@@ -53,9 +53,12 @@ class GraphState(TypedDict):
 
 app = FastAPI()
 
+allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173")
+allowed_origins = [origin.strip() for origin in allowed_origins_env.split(",") if origin.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -471,7 +474,7 @@ async def run_evaluation(state: ResearchState) -> Dict[str, Any]:
     return {"coverage": 0, "evidence": 0, "clarity": 0, "notes": response.content}
 
 
-async def search_duckduckgo(query: str, max_results: int = 5) -> List[SearchResult]:
+def _search_duckduckgo_sync(query: str, max_results: int = 5) -> List[SearchResult]:
     try:
         from ddgs import DDGS
     except Exception as exc:
@@ -491,6 +494,11 @@ async def search_duckduckgo(query: str, max_results: int = 5) -> List[SearchResu
     return results
 
 
+async def search_duckduckgo(query: str, max_results: int = 5) -> List[SearchResult]:
+    # ddgs is synchronous; run in a worker thread to avoid blocking the event loop.
+    return await asyncio.to_thread(_search_duckduckgo_sync, query, max_results)
+
+
 async def search_wikipedia(query: str, max_results: int = 5) -> List[SearchResult]:
     params = {
         "action": "query",
@@ -499,14 +507,18 @@ async def search_wikipedia(query: str, max_results: int = 5) -> List[SearchResul
         "format": "json",
         "srlimit": max_results,
     }
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.get(
-            "https://en.wikipedia.org/w/api.php",
-            params=params,
-            headers={"User-Agent": "DeepResearchAgent/1.0 (research-bot)"},
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(
+                "https://en.wikipedia.org/w/api.php",
+                params=params,
+                headers={"User-Agent": "DeepResearchAgent/1.0 (research-bot)"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.HTTPError as exc:
+        logger.warning("Wikipedia search failed query=%s error=%s", query, str(exc))
+        return []
     results: List[SearchResult] = []
     for item in data.get("query", {}).get("search", []):
         title = item.get("title", "Untitled")
@@ -1188,6 +1200,9 @@ async def run_research(body: Dict[str, Any]) -> Dict[str, Any]:
         "critic_notes": "",
         "verifier_notes": "",
         "uncertainty_score": 0.5,
+        "confidence_score": 0.0,
+        "evaluation": {},
+        "transparency": {},
     }
     save_run(run_id, session_id, query, depth, "running", {"state": state})
     result = await run_research_loop(state)
@@ -1263,6 +1278,9 @@ async def run_research_stream(body: Dict[str, Any], request: Request) -> Streami
                 "critic_notes": "",
                 "verifier_notes": "",
                 "uncertainty_score": 0.5,
+                "confidence_score": 0.0,
+                "evaluation": {},
+                "transparency": {},
             }
 
             save_run(run_id, session_id, query, depth, "running", {"state": state})
@@ -1294,6 +1312,7 @@ async def run_research_stream(body: Dict[str, Any], request: Request) -> Streami
             save_run(run_id, session_id, query, depth, "synthesizing", {"state": state})
             prompt = build_writer_prompt(state)
             await emit_status("writer", "Writing report", None)
+            report_parts: List[str] = []
 
             async for chunk in research_llm_stream.astream(prompt):
                 if await request.is_disconnected():
@@ -1301,10 +1320,12 @@ async def run_research_stream(body: Dict[str, Any], request: Request) -> Streami
                 delta = getattr(chunk, "content", None)
                 if not delta:
                     continue
+                report_parts.append(delta)
                 payload = json.dumps({"delta": delta})
                 yield f"data: {payload}\n\n"
 
             if not await request.is_disconnected():
+                state["report"] = "".join(report_parts)
                 state["confidence_score"] = compute_confidence(
                     state["sources"], state["uncertainty_score"]
                 )
